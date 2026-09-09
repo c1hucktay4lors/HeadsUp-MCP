@@ -5,9 +5,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// --- HARDCODED BOT TOKEN ---
-const TELEGRAM_TOKEN = "8625063884:AAF4GGBGbzBKWmnNL-VKFFCckB5NqfjaK3s";
-// ---------------------------
+// Bot token comes from the environment (set in mcp.json). Never hardcode it.
+const TELEGRAM_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || "").trim();
+if (!TELEGRAM_TOKEN) {
+    console.error("❌ Missing TELEGRAM_BOT_TOKEN — add it to the env block in mcp.json.");
+    process.exit(1);
+}
+
 // API base is normally https://api.telegram.org — overridable via env for
 // testing (mock Bot API) or proxying.
 const API_BASE = (process.env.TELEGRAM_API_BASE || "https://api.telegram.org").replace(/\/+$/, "");
@@ -96,6 +100,11 @@ const emptyRetrieves = { count: 0, since: 0 };
 
 const CHAT_SET = new Set(CHAT_IDS);
 
+// True once main() confirms this instance holds the poll lock.
+let IS_POLLER = false;
+const STANDBY_NOTE =
+    "⚠️ This instance is in STANDBY — another instance is the one polling Telegram, and the user's reply is in THAT instance's queue, not this one's. Do not treat an empty result here as 'the user didn't reply.' If you see this, the toolkit has multiple live instances; restart LM Studio so a single instance owns the connection.";
+
 // ============================================================
 //  SINGLE-INSTANCE LOCK
 // ============================================================
@@ -163,8 +172,9 @@ function handleIncoming(msg) {
     const i = incoming.waiters.findIndex((w) => !w.consumed);
     if (i !== -1) {
         const waiter = incoming.waiters[i];
-        incoming.waiters.splice(i, 1);
+        waiter.consumed = true;
         const msgs = [{ ...entry, waitedMs: Date.now() - waiter.startedAt }];
+        removeWaiter(waiter);
         waiter.resolve(msgs);
         log(`delivered to waiting caller (waited ${Math.round(msgs[0].waitedMs / 1000)}s)`);
     } else {
@@ -173,34 +183,54 @@ function handleIncoming(msg) {
     }
 }
 
-async function pollOnce() {
-    let url = `${API_BASE}/bot${TELEGRAM_TOKEN}/getUpdates?timeout=0&allowed_updates=["message"]`;
-    let processMsgs = true;
-    if (incoming.lastUpdateId === null) {
-        // First poll: anchor the offset to "now" without processing the stale
-        // backlog (messages from before this server started are not replies).
-        url += "&limit=100";
-        processMsgs = false;
-    } else {
-        url += `&offset=${incoming.lastUpdateId}`; // getUpdates returns ids strictly greater
-    }
+function getUpdatesUrl(offset, limit) {
+    const params = new URLSearchParams();
+    params.set("timeout", "0");
+    params.set("allowed_updates", JSON.stringify(["message"]));
+    if (offset !== null) params.set("offset", String(offset));
+    if (limit) params.set("limit", String(limit));
+    return `${API_BASE}/bot${TELEGRAM_TOKEN}/getUpdates?${params.toString()}`;
+}
 
+async function fetchUpdates(url) {
     const res = await fetch(url);
     if (!res.ok) {
         let detail = `HTTP ${res.status}`;
         try { detail = (await res.json()).description || detail; } catch {}
         throw new Error(detail);
     }
+    return (await res.json()).result || [];
+}
 
-    const data = await res.json();
-    if (incoming.lastUpdateId === null && data.result.length === 0) {
-        // No history at all (fresh bot) — anchor at 0 and start processing.
-        incoming.lastUpdateId = 0;
+// IMPORTANT: real Telegram getUpdates is INCLUSIVE — it returns updates with
+// update_id >= offset (verified live: offset=N returns N). So after seeing id N
+// the next request MUST use offset N+1. Using offset=N re-delivers the last
+// update on every poll (that was the root cause of the /start flood).
+
+// Discard the entire pre-existing backlog WITHOUT processing it (messages from
+// before this server started are not replies). Loops until getUpdates is empty,
+// so it works even when the backlog is larger than one 100-update page.
+async function anchorToNow() {
+    let offset = 0;
+    let maxId = 0;
+    for (let guard = 0; guard < 1000; guard++) {
+        const result = await fetchUpdates(getUpdatesUrl(offset, 100));
+        if (result.length === 0) break;
+        for (const u of result) maxId = Math.max(maxId, u.update_id);
+        offset = maxId + 1;
     }
-    for (const u of data.result) {
-        incoming.lastUpdateId = Math.max(incoming.lastUpdateId ?? 0, u.update_id);
+    return maxId; // first real poll will use offset maxId + 1
+}
+
+async function pollOnce() {
+    if (incoming.lastUpdateId === null) {
+        incoming.lastUpdateId = await anchorToNow();
+    }
+    const result = await fetchUpdates(getUpdatesUrl(incoming.lastUpdateId + 1, 100));
+    for (const u of result) {
+        incoming.lastUpdateId = Math.max(incoming.lastUpdateId, u.update_id);
         // NOTE: chat.id arrives as a JSON number; CHAT_SET holds strings from env.
-        if (processMsgs && u.message && CHAT_SET.has(String(u.message.chat?.id))) handleIncoming(u.message);
+        if (u.message && CHAT_SET.has(String(u.message.chat?.id))) handleIncoming(u.message);
     }
 }
 
@@ -214,7 +244,8 @@ function startPolling() {
             } catch (e) {
                 consecutiveErrors++;
                 if (/401/.test(e.message)) {
-                    log(`fatal: ${e.message} (invalid bot token) — stopping poller`);
+                    log(`fatal: ${e.message} (invalid bot token) — stopping poller and releasing lock`);
+                    releaseLockIfOurs(); // don't hold the lock while dead
                     return;
                 }
                 if (/409/.test(e.message)) {
@@ -233,6 +264,12 @@ function takePending() {
     const msgs = incoming.pending;
     incoming.pending = [];
     return msgs;
+}
+
+function removeWaiter(waiter) {
+    waiter.consumed = true;
+    const i = incoming.waiters.indexOf(waiter);
+    if (i !== -1) incoming.waiters.splice(i, 1);
 }
 
 function formatMessages(msgs) {
@@ -326,7 +363,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const style = NOTIF_TYPES[type] || NOTIF_TYPES.success;
-        const header = `*${style.title}*`;
+        const header = `*${title || style.title}*`; // custom title falls back to the type label
         const chunks = splitMessage(message);
 
         // First chunk gets the bold title, the rest are plain continuations
@@ -391,6 +428,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             emptyRetrieves.count = 0;
             return textResult(formatMessages(msgs));
         }
+        // Standby instance: an empty queue here is NOT proof of no reply — the
+        // reply may be sitting in the active (polling) instance's queue.
+        if (!IS_POLLER) {
+            return textResult(STANDBY_NOTE, true);
+        }
         // Circuit breaker: repeated empty polls in a short window
         const now = Date.now();
         if (now - emptyRetrieves.since > 10000) { emptyRetrieves.count = 0; emptyRetrieves.since = now; }
@@ -426,7 +468,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return textResult(`⚠️ You already asked this same question ${Math.round((now - lastAsk.at) / 1000)}s ago and the user did not answer. STOP: do not ask it again and do not continue the task. End your response and wait for the user to reply in LM Studio.`, true);
         }
 
-        // Send the question to all chats first
+        // Standby instance: it cannot capture the reply (that happens in the
+        // active/polling instance). Send the question so the user sees it, then
+        // report clearly instead of blocking on a queue that will stay empty.
+        if (!IS_POLLER) {
+            const sfail = [];
+            for (const chatId of CHAT_IDS) {
+                for (const chunk of splitMessage(question)) {
+                    try { await sendTelegram(chatId, { text: chunk }); }
+                    catch (e) { sfail.push(`chat ${chatId}: ${e.message}`); break; }
+                }
+            }
+            if (sfail.length > 0) {
+                return textResult(`❌ Could not deliver the question (${sfail.join("; ")}).`, true);
+            }
+            return textResult(`✅ Question sent to the user, but ${STANDBY_NOTE}`, true);
+        }
+
+        // Register the waiter BEFORE sending the question, so a reply that
+        // arrives while we are still sending is captured (not lost to a
+        // spurious "timed out"). If the send fails we cancel the waiter.
+        const waiter = { resolve: null, startedAt: Date.now(), consumed: false };
+        incoming.waiters.push(waiter);
+
+        // Send the question to all chats
         const failures = [];
         for (const chatId of CHAT_IDS) {
             for (const chunk of splitMessage(question)) {
@@ -439,23 +504,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
         }
         if (failures.length > 0) {
+            removeWaiter(waiter);
             return textResult(`❌ Could not deliver the question (${failures.join("; ")}). The user never saw it, so do not wait.`, true);
         }
 
-        // Block until the next inbound message arrives or the timeout expires
-        const waiter = { resolve: null, startedAt: Date.now(), consumed: false };
-        incoming.waiters.push(waiter);
+        // A reply may have arrived while we were sending — serve it now.
+        if (incoming.pending.length > 0) {
+            const msgs = takePending();
+            removeWaiter(waiter);
+            lastAsk.question = question.trim();
+            lastAsk.at = Date.now();
+            lastAsk.timedOut = false;
+            return textResult(formatWaitResult(msgs, false, timeoutS));
+        }
 
+        // Block until the next inbound message arrives or the timeout expires
         const result = await new Promise((resolve) => {
             waiter.resolve = resolve;
-            setTimeout(() => {
+            const t = setTimeout(() => {
                 if (!waiter.consumed) {
-                    waiter.consumed = true;
-                    const i = incoming.waiters.indexOf(waiter);
-                    if (i !== -1) incoming.waiters.splice(i, 1);
+                    removeWaiter(waiter);
                     resolve([]); // timed out
                 }
-            }, timeoutS * 1000).unref?.();
+            }, timeoutS * 1000);
+            t.unref?.();
         });
 
         lastAsk.question = question.trim();
@@ -473,14 +545,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
-    const isPoller = acquireLock();
-    if (isPoller) {
+    IS_POLLER = acquireLock();
+    if (IS_POLLER) {
         log("acquired poll lock — this instance polls Telegram");
         startPolling(); // start capturing inbound Telegram messages (non-blocking)
     } else {
-        log("another instance is already polling — STANDBY (no polling, no acks)");
+        log("another instance is already polling — STANDBY (no polling)");
     }
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }
-main();
+main().catch((err) => {
+    // Fatal startup errors (e.g. transport connect failure) must not leave an
+    // unhandled rejection or a held lock.
+    console.error("[telegram-notifier] fatal:", err?.stack || err);
+    releaseLockIfOurs();
+    process.exit(1);
+});

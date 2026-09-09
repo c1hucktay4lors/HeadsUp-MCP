@@ -8,7 +8,7 @@ A lightweight MCP server for [LM Studio](https://lmstudio.ai/) that gives the AI
 
 ## How It Works
 
-- **Bot Token** → hardcoded in `index.js` (created once via @BotFather)
+- **Bot Token** → set via `TELEGRAM_BOT_TOKEN` in `mcp.json` (created once via @BotFather; never hardcoded)
 - **Chat ID(s)** → configured per-user in `mcp.json` (multiple supported, comma-separated)
 - The AI automatically calls the `send_telegram_notification` tool when it finishes your prompt
 - Notifications come in four flavors: ✅ success, ℹ️ info, ⚠️ warning, ❌ error
@@ -48,27 +48,24 @@ npm install @modelcontextprotocol/sdk
 
 ### 5. Configure
 
-**`index.js`** — paste your bot token on line 6:
-
-```javascript
-const TELEGRAM_TOKEN = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz";
-```
-
-**`mcp.json`** (LM Studio MCP settings) — paste your Chat ID:
+**`mcp.json`** (LM Studio MCP settings) — set your Chat ID **and** bot token in the `env` block (the token is read from the environment, never hardcoded):
 
 ```json
 {
   "mcpServers": {
     "telegram-notifier": {
       "command": "node",
-      "args": ["/home/YOUR_USER/Projects/sms-mcp/index.js"],
+      "args": ["/home/YOUR_USER/Projects/HeadsUp_mcp/HeadsUp_MCP/index.js"],
       "env": {
-        "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"
+        "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID",
+        "TELEGRAM_BOT_TOKEN": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
       }
     }
   }
 }
 ```
+
+> If `TELEGRAM_BOT_TOKEN` is missing the server logs a clear error to stderr and exits.
 
 > **Multiple devices?** Put several chat IDs in the same value, comma-separated:
 > `"TELEGRAM_CHAT_ID": "123456789,987654321"` — every notification goes to all of them.
@@ -156,7 +153,7 @@ Give them `index.js` and `package.json`. They:
 3. Start the bot in Telegram
 4. Add their Chat ID to their own `mcp.json`
 
-No token sharing needed — the bot token is already baked into `index.js`.
+Each person sets their own `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in their `mcp.json` — the token is never hardcoded in the source.
 
 ## Troubleshooting
 

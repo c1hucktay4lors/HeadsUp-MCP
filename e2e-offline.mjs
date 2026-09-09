@@ -27,7 +27,7 @@ const resetMock = () => { state.updates.length = 0; state.sent.length = 0; state
 const makeClient = async () => {
     const transport = new StdioClientTransport({
         command: "node", args: ["index.js"],
-        env: { ...process.env, TELEGRAM_CHAT_ID: CHAT, TELEGRAM_API_BASE: API_BASE },
+        env: { ...process.env, TELEGRAM_CHAT_ID: CHAT, TELEGRAM_API_BASE: API_BASE, TELEGRAM_BOT_TOKEN: "mock-token" },
         stderr: "inherit"
     });
     const client = new Client({ name: "offline-e2e", version: "1.0.0" }, { capabilities: {} });
@@ -164,12 +164,37 @@ const bRes = text(await B.client.callTool({ name: "retrieve_messages", arguments
 check("exactly ONE instance captured the message (single poller)",
     aRes.includes("who-am-i") !== bRes.includes("who-am-i"),
     `A: ${aRes.slice(0, 60)} | B: ${bRes.slice(0, 60)}`);
-check("standby instance's retrieve stays empty (no double consumption)",
-    (aRes.includes("who-am-i") ? bRes : aRes).includes("No new messages")
-    || (aRes.includes("No new messages") && bRes.includes("No new messages")));
+const other = aRes.includes("who-am-i") ? bRes : aRes;
+check("the other instance does NOT report the message (no double consumption)",
+    !other.includes("who-am-i") && (other.includes("No new messages") || other.includes("STANDBY")),
+    other.slice(0, 80));
 
 await A.transport.close();
 await B.transport.close();
+
+// --- 10. REGRESSION: a single update must NOT be re-delivered across polls ---
+// Root cause of the /start flood: real getUpdates is INCLUSIVE (offset=N
+// returns N). The old code used offset=lastUpdateId, so the last-seen update
+// was re-queued on EVERY poll. This test would have caught it.
+resetMock();
+const C = await makeClient();
+await sleep(1500); // anchor + first poll
+await pushUserMsg("flood-test");
+let first = "";
+for (let i = 0; i < 20; i++) {
+    first = text(await C.client.callTool({ name: "retrieve_messages", arguments: {} }));
+    if (first.includes("flood-test")) break;
+    await sleep(300);
+}
+check("message captured on first retrieve", first.includes("flood-test"), first.slice(0, 80));
+check("…exactly once (no intra-call duplication)",
+    (first.match(/flood-test/g) || []).length === 1, first.slice(0, 80));
+await sleep(4000); // let several more poll cycles run with NO new messages
+const second = text(await C.client.callTool({ name: "retrieve_messages", arguments: {} }));
+check("same update NOT re-queued on later polls (flood regression)",
+    !second.includes("flood-test"), second.slice(0, 100));
+
+await C.transport.close();
 mock.close();
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -30,7 +30,9 @@ function handler(req, res) {
             const offset = Number(url.searchParams.get("offset") || 0);
             const limit = Number(url.searchParams.get("limit") || 100);
             state.maxSeenOffset = Math.max(state.maxSeenOffset, offset);
-            const result = state.updates.filter((u) => u.update_id > offset).slice(0, limit);
+            // Real Telegram is INCLUSIVE: returns update_id >= offset.
+            // (Using `>` here is exactly what masked the /start flood bug.)
+            const result = state.updates.filter((u) => u.update_id >= offset).slice(0, limit);
             return json(res, 200, { ok: true, result });
         }
         if (p.endsWith("/deleteWebhook")) {
