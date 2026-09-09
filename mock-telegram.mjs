@@ -6,7 +6,8 @@ import http from "node:http";
 const state = {
     updates: [], // { update_id, message: { chat:{id}, text, date } }
     nextId: 1,
-    sent: []     // recorded sendMessage bodies
+    sent: [],    // recorded sendMessage bodies
+    maxSeenOffset: 0 // highest offset any poller requested (== server's lastUpdateId)
 };
 
 function json(res, code, obj) {
@@ -28,6 +29,7 @@ function handler(req, res) {
         if (p.endsWith("/getUpdates")) {
             const offset = Number(url.searchParams.get("offset") || 0);
             const limit = Number(url.searchParams.get("limit") || 100);
+            state.maxSeenOffset = Math.max(state.maxSeenOffset, offset);
             const result = state.updates.filter((u) => u.update_id > offset).slice(0, limit);
             return json(res, 200, { ok: true, result });
         }

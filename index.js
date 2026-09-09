@@ -1,6 +1,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // --- HARDCODED BOT TOKEN ---
 const TELEGRAM_TOKEN = "8625063884:AAF4GGBGbzBKWmnNL-VKFFCckB5NqfjaK3s";
@@ -84,7 +87,58 @@ const incoming = {
     lastUpdateId: null    // offset for getUpdates
 };
 
+// Loop guards — small local models can get stuck calling these tools in a
+// tight loop. The guards make the server itself say "stop" instead of
+// silently serving the loop.
+const ASK_COOLDOWN_MS = 30000; // re-asking a question that just timed out
+const lastAsk = { question: null, at: 0, timedOut: false };
+const emptyRetrieves = { count: 0, since: 0 };
+
 const CHAT_SET = new Set(CHAT_IDS);
+
+// ============================================================
+//  SINGLE-INSTANCE LOCK
+// ============================================================
+// LM Studio can leave old MCP bridge workers (and their server
+// instances) running across restarts. Every live instance polls
+// the same bot token, and Telegram delivers each update to EVERY
+// instance — so N instances = N acks per message + N model loops.
+// Only the instance holding this lock may poll; the others go to
+// standby (they still serve tool calls from their own queues).
+// The lock is keyed per API base, so offline/mock tests are unaffected.
+const LOCK_FILE = path.join(
+    os.tmpdir(),
+    `headsup-telegram-${Buffer.from(`${API_BASE}|${TELEGRAM_TOKEN}|${CHAT_IDS.join(",")}`).toString("base64url").slice(0, 32)}.lock`
+);
+
+function isProcessAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function acquireLock() {
+    try {
+        const fd = fs.openSync(LOCK_FILE, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY);
+        fs.writeSync(fd, String(process.pid));
+        fs.closeSync(fd);
+        return true; // this instance is the poller
+    } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+        let ownerPid = 0;
+        try { ownerPid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim()); } catch {}
+        if (ownerPid && ownerPid !== process.pid && isProcessAlive(ownerPid)) {
+            return false; // live owner — standby
+        }
+        try { fs.unlinkSync(LOCK_FILE); } catch {} // stale lock — steal
+        return acquireLock();
+    }
+}
+
+function releaseLockIfOurs() {
+    try {
+        const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+        if (pid === process.pid) fs.unlinkSync(LOCK_FILE);
+    } catch {}
+}
 
 function handleIncoming(msg) {
     const text = (msg.text || msg.caption || "").trim();
@@ -93,7 +147,7 @@ function handleIncoming(msg) {
         chat_id: msg.chat?.id,
         time: new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString()
     };
-    log(`inbound: ${entry.chat_id} -> ${text ? JSON.stringify(text) : "[non-text]"}`);
+    log(`inbound: ${entry.chat_id} -> ${text ? JSON.stringify(text) : "[non-text]"} (instance ${process.pid})`);
 
     incoming.recent.push(entry);
     if (incoming.recent.length > MAX_BUFFERED) incoming.recent.shift();
@@ -102,6 +156,10 @@ function handleIncoming(msg) {
 
     // A reply goes to exactly ONE consumer: a blocking wait_for_reply caller
     // if one is active, otherwise the pending queue for retrieve_messages.
+    // NOTE: no auto-ack here on purpose — sending a bot reply in response to
+    // the user's message created a feedback loop with chatty models (their
+    // steering messages each triggered a bot message, which triggered another
+    // model turn, ...). The model sees the reply in the tool result anyway.
     const i = incoming.waiters.findIndex((w) => !w.consumed);
     if (i !== -1) {
         const waiter = incoming.waiters[i];
@@ -113,10 +171,6 @@ function handleIncoming(msg) {
         incoming.pending.push(entry);
         log(`${incoming.pending.length} message(s) pending for the model`);
     }
-
-    // Let the user know the reply reached the AI (best effort, non-fatal)
-    sendTelegram(entry.chat_id, { text: "👍 Got it — I'll pass this to the AI." })
-        .catch((e) => log(`ack failed: ${e.message}`));
 }
 
 async function pollOnce() {
@@ -192,12 +246,21 @@ function formatWaitResult(msgs, timedOut, timeoutS) {
         return `📬 User replied after ~${msgs[0].waitedMs ? Math.round(msgs[0].waitedMs / 1000) : 0}s:\n${msgs.map((m) => m.text).join("\n---\n")}`;
     }
     if (timedOut) {
-        return `⏱️ Timed out after ${timeoutS}s — the user did not reply. Continue the task with your best judgement instead of waiting further.`;
+        return `⏱️ No reply after ${timeoutS}s. STOP HERE: do not continue the task, do not ask this question again, and do not send any further messages to the bot. End your response and wait — the user will answer in LM Studio when ready.`;
     }
     return "❌ No reply received.";
 }
 
-const server = new Server({ name: "telegram-notifier", version: "2.1.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "telegram-notifier", version: "2.2.0" }, { capabilities: { tools: {} } });
+
+// A stdio MCP server must die with its client. Without this, the poll loop
+// keeps the process alive forever after LM Studio drops the connection —
+// that is exactly how zombie pollers accumulate (each one re-receives every
+// user message and re-acks it).
+server.onclose = () => {
+    releaseLockIfOurs();
+    process.exit(0);
+};
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{
@@ -216,7 +279,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
         name: "send_message",
-        description: "Send a plain message to the user on Telegram (no notification header). Use this to ask the user a question or give them an update. The user can reply in Telegram, and you can read their reply with the retrieve_messages or wait_for_reply tool.",
+        description: "Send a plain message to the user on Telegram (no notification header). Use this to ask the user a question or give them an update. Do NOT send several messages in a row without first receiving the user's reply. Read their reply with the retrieve_messages or wait_for_reply tool.",
         inputSchema: {
             type: "object",
             properties: {
@@ -227,7 +290,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
         name: "retrieve_messages",
-        description: "Fetch messages the user has sent on Telegram since your last call to this tool (or since the server started). Returns all of them, or a notice that there are no new messages yet. If the user has not replied yet, you may call it again after doing other work.",
+        description: "Fetch messages the user has sent on Telegram since your last call to this tool (or since the server started). Returns all of them, or a notice that there are no new messages. If there are no new messages, do NOT call this tool again — end your response and wait for the user to reply in LM Studio.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -236,7 +299,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
         name: "wait_for_reply",
-        description: "Ask the user a question on Telegram and wait for their reply. Blocks up to 55 seconds (default 45). If it times out, just call it again — any reply that arrived meanwhile is returned immediately. Use this whenever you need an answer from the user before continuing.",
+        description: "Ask the user a question on Telegram and wait for their reply. Blocks up to 55 seconds (default 45). If the user replies, continue with their answer. If it times out, STOP: do not continue the task, do not ask the same question again — end your response and wait for the user to reply in LM Studio.",
         inputSchema: {
             type: "object",
             properties: {
@@ -324,10 +387,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ---------- retrieve_messages ----------
     if (name === "retrieve_messages") {
         const msgs = takePending();
-        if (msgs.length === 0) {
-            return textResult("📭 No new messages from the user yet. If you asked them something, call retrieve_messages again later — or use wait_for_reply to block until they answer.");
+        if (msgs.length > 0) {
+            emptyRetrieves.count = 0;
+            return textResult(formatMessages(msgs));
         }
-        return textResult(formatMessages(msgs));
+        // Circuit breaker: repeated empty polls in a short window
+        const now = Date.now();
+        if (now - emptyRetrieves.since > 10000) { emptyRetrieves.count = 0; emptyRetrieves.since = now; }
+        emptyRetrieves.count++;
+        if (emptyRetrieves.count >= 3) {
+            return textResult("🛑 STOP: you have checked for replies 3 times in a row with nothing new. Do NOT call retrieve_messages again and do not continue the task. End your response and wait for the user to reply in LM Studio — their reply will still be here when you next check.");
+        }
+        return textResult("📭 No new messages from the user yet. Do NOT call this tool again immediately. If you need an answer before continuing, use wait_for_reply once — otherwise end your response and wait for the user in LM Studio.");
     }
 
     // ---------- wait_for_reply ----------
@@ -341,8 +412,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // A reply may already be waiting (e.g. it arrived right after a
         // previous timed-out call) — hand it over without re-asking.
         if (incoming.pending.length > 0) {
+            lastAsk.question = question.trim();
+            lastAsk.at = Date.now();
+            lastAsk.timedOut = false;
             const msgs = takePending();
             return textResult(formatWaitResult(msgs, false, timeoutS));
+        }
+
+        // Loop guard: this exact question just timed out — don't spam the user
+        // with the same question in a tight loop.
+        const now = Date.now();
+        if (lastAsk.timedOut && lastAsk.question === question.trim() && now - lastAsk.at < ASK_COOLDOWN_MS) {
+            return textResult(`⚠️ You already asked this same question ${Math.round((now - lastAsk.at) / 1000)}s ago and the user did not answer. STOP: do not ask it again and do not continue the task. End your response and wait for the user to reply in LM Studio.`, true);
         }
 
         // Send the question to all chats first
@@ -377,6 +458,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }, timeoutS * 1000).unref?.();
         });
 
+        lastAsk.question = question.trim();
+        lastAsk.at = Date.now();
+        lastAsk.timedOut = result.length === 0;
+
         if (result.length > 0) {
             return textResult(formatWaitResult(result, false, timeoutS));
         }
@@ -388,7 +473,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
-    startPolling(); // start capturing inbound Telegram messages (non-blocking)
+    const isPoller = acquireLock();
+    if (isPoller) {
+        log("acquired poll lock — this instance polls Telegram");
+        startPolling(); // start capturing inbound Telegram messages (non-blocking)
+    } else {
+        log("another instance is already polling — STANDBY (no polling, no acks)");
+    }
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }

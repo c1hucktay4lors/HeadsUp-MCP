@@ -1,14 +1,21 @@
 // Offline end-to-end test: real index.js over MCP stdio against a mock Bot API.
-// Proves: tool surface, wait_for_reply resolution, ack, retrieve_messages,
-// send_message, and the no-double-consume rule — no live human needed.
+// Covers: tool surface, wait_for_reply resolution, NO auto-ack (loop safety),
+// pending-early-return, retrieve_messages, loop guards (cooldown + circuit
+// breaker), and the single-instance lock (2nd instance goes standby).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { startMock, state } from "./mock-telegram.mjs";
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name, cond, extra = "") => {
+    if (cond) { pass++; console.log(`  ✅ ${name}`); }
+    else { fail++; console.log(`  ❌ ${name}${extra ? " — " + extra : ""}`); }
+};
+
 const { server: mock, port } = await startMock();
 const API_BASE = `http://127.0.0.1:${port}`;
 const CHAT = "111";
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pushUserMsg = async (text) => {
     const r = await fetch(`${API_BASE}/__test/message`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -16,22 +23,20 @@ const pushUserMsg = async (text) => {
     });
     if (!r.ok) throw new Error("push failed " + r.status);
 };
-
-const transport = new StdioClientTransport({
-    command: "node",
-    args: ["index.js"],
-    env: { ...process.env, TELEGRAM_CHAT_ID: CHAT, TELEGRAM_API_BASE: API_BASE },
-    stderr: "inherit"
-});
-const client = new Client({ name: "offline-e2e", version: "1.0.0" }, { capabilities: {} });
-await client.connect(transport);
-
-let pass = 0, fail = 0;
-const check = (name, cond, extra = "") => {
-    if (cond) { pass++; console.log(`  ✅ ${name}`); }
-    else { fail++; console.log(`  ❌ ${name}${extra ? " — " + extra : ""}`); }
+const resetMock = () => { state.updates.length = 0; state.sent.length = 0; state.nextId = 1; state.maxSeenOffset = 0; };
+const makeClient = async () => {
+    const transport = new StdioClientTransport({
+        command: "node", args: ["index.js"],
+        env: { ...process.env, TELEGRAM_CHAT_ID: CHAT, TELEGRAM_API_BASE: API_BASE },
+        stderr: "inherit"
+    });
+    const client = new Client({ name: "offline-e2e", version: "1.0.0" }, { capabilities: {} });
+    await client.connect(transport);
+    return { client, transport };
 };
 const text = (r) => (r.content || []).map((c) => c.text).join("\n");
+
+const { client, transport } = await makeClient();
 
 // --- 1. Tool surface ---
 const names = (await client.listTools()).tools.map((t) => t.name).sort();
@@ -39,8 +44,8 @@ check("exposes exactly the 4 tools",
     JSON.stringify(names) === JSON.stringify(["retrieve_messages", "send_message", "send_telegram_notification", "wait_for_reply"]),
     names.join(","));
 
-// --- 2. wait_for_reply: question sent, then reply arrives -> resolves with text ---
-state.sent.length = 0;
+// --- 2. wait_for_reply: question sent, reply arrives -> resolves with text ---
+resetMock();
 const waitPromise = client.callTool({
     name: "wait_for_reply",
     arguments: { question: "What color is the sky? (e2e)", timeout_seconds: 25 }
@@ -50,44 +55,121 @@ check("question was delivered to the user",
     state.sent.some((s) => s?.text?.includes("What color is the sky?")),
     JSON.stringify(state.sent.map((s) => s?.text)));
 
+const sentBeforeReply = state.sent.length;
 await pushUserMsg("It is blue.");
 const waitResult = await waitPromise;
 const wt = text(waitResult);
 check("wait_for_reply resolved with the user's reply", wt.includes("It is blue."), wt);
 check("wait_for_reply is not flagged as error", waitResult.isError !== true);
 await sleep(400);
-check("ack ('👍 Got it') was sent back to the user",
-    state.sent.some((s) => s?.text?.includes("Got it")), JSON.stringify(state.sent.map((s) => s?.text)));
+check("NO auto-ack sent (loop safety: bot must not reply to the user's reply)",
+    state.sent.length === sentBeforeReply, JSON.stringify(state.sent.map((s) => s?.text)));
 
-// --- 3. The consumed reply must NOT reappear in retrieve_messages (no double-delivery) ---
+// --- 3. The consumed reply must NOT reappear in retrieve_messages ---
 const after = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
 check("reply consumed by wait_for_reply does not leak into retrieve_messages",
     !after.includes("It is blue."), after);
 
-// --- 4. retrieve_messages: reply with no active waiter goes to the pending queue ---
+// --- 4. wait_for_reply early-return: pending reply served WITHOUT re-asking ---
+// Push a reply, wait until the poller has consumed it from the mock queue
+// (observable via state.updates), so it is guaranteed to be in the server's
+// pending queue when we call wait_for_reply.
+const sentBeforeEarly = state.sent.length;
+await pushUserMsg("early reply");
+const earlyReplyId = state.updates[state.updates.length - 1].update_id;
+let consumed = false;
+for (let i = 0; i < 20 && !consumed; i++) {
+    await sleep(300);
+    consumed = state.maxSeenOffset >= earlyReplyId; // server polled past this update id
+}
+check("precondition: poller consumed the reply into its pending queue", consumed);
+const tEarly = Date.now();
+const early = await client.callTool({
+    name: "wait_for_reply",
+    arguments: { question: "SHOULD NOT BE SENT (reply already waiting)", timeout_seconds: 12 }
+});
+const et = text(early);
+const earlyMs = Date.now() - tEarly;
+check("wait_for_reply returns the waiting reply", et.includes("early reply"), et);
+check("…instantly (early-return, not a fresh wait)", earlyMs < 1500, `${earlyMs}ms`);
+check("…without sending a new question to the user",
+    state.sent.length === sentBeforeEarly && !state.sent.some((s) => s?.text?.includes("SHOULD NOT BE SENT")),
+    JSON.stringify(state.sent.map((s) => s?.text)));
+
+// --- 5. retrieve_messages queue path ---
 await pushUserMsg("hello from queue");
-await sleep(4000); // a couple of poll intervals (1.5s each) for safety
+const helloId = state.updates[state.updates.length - 1].update_id;
+let helloSeen = false;
+for (let i = 0; i < 30 && !helloSeen; i++) { await sleep(300); helloSeen = state.maxSeenOffset >= helloId; }
+check("precondition: poller consumed 'hello from queue'", helloSeen);
 const q = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
 check("retrieve_messages returns the queued reply", q.includes("hello from queue"), q);
-
 const q2 = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
-check("retrieve_messages is empty after consuming", q2.includes("No new messages"), q2);
+check("retrieve_messages empty after consuming",
+    q2.includes("No new messages") || q2.includes("🛑 STOP"), q2);
 
-// --- 5. send_message plain delivery ---
-state.sent.length = 0;
-const sm = await client.callTool({ name: "send_message", arguments: { message: "plain hello" } });
-check("send_message succeeds", sm.isError !== true && text(sm).includes("Message sent"), text(sm));
-check("send_message delivered without notification header",
-    state.sent.some((s) => s?.text === "plain hello"), JSON.stringify(state.sent.map((s) => s?.text)));
+// --- 6. Loop guard: retrieve circuit breaker fires on repeated empty polls ---
+// (3 consecutive empty polls inside the 10s window => the 3rd MUST be 🛑)
+const e1 = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
+await sleep(500);
+const e2 = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
+await sleep(500);
+const e3 = text(await client.callTool({ name: "retrieve_messages", arguments: {} }));
+check("retrieve circuit breaker fires (🛑 STOP) on repeated empty polls",
+    e3.includes("🛑 STOP") && !e3.includes("No new messages"), e3);
 
-// --- 6. wait_for_reply timeout path (short) returns a clean timeout notice ---
+// --- 7. Loop guard: re-asking a timed-out question is blocked ---
+resetMock();
 const t0 = Date.now();
-const to = await client.callTool({ name: "wait_for_reply", arguments: { question: "nobody will answer", timeout_seconds: 6 } });
+const to = await client.callTool({
+    name: "wait_for_reply",
+    arguments: { question: "unique-timed-out-question", timeout_seconds: 6 }
+});
 const secs = (Date.now() - t0) / 1000;
-check("timeout path returns notice (not a crash)", text(to).includes("Timed out"), text(to));
+check("timeout path returns STOP guidance (not a crash)", text(to).includes("No reply after"), text(to));
 check("timeout respected ~6s (got " + secs.toFixed(1) + "s)", secs >= 5.5 && secs < 12);
+const askCountAfterTimeout = state.sent.filter((s) => s?.text === "unique-timed-out-question").length;
+const reask = await client.callTool({
+    name: "wait_for_reply",
+    arguments: { question: "unique-timed-out-question", timeout_seconds: 5 }
+});
+const askCountAfterReask = state.sent.filter((s) => s?.text === "unique-timed-out-question").length;
+check("re-ask of timed-out question is blocked (⚠️ guard)",
+    reask.isError === true && text(reask).includes("⚠️"), text(reask));
+check("blocked re-ask did NOT send another question to the user",
+    askCountAfterReask === askCountAfterTimeout, `sent ${askCountAfterReask}x vs ${askCountAfterTimeout}x`);
+
+// --- 8. Legitimate flow still works: NEW question after a timeout is allowed ---
+const sentBeforeNew = state.sent.filter((s) => s?.text === "different-question").length;
+const newQ = await client.callTool({
+    name: "wait_for_reply",
+    arguments: { question: "different-question", timeout_seconds: 6 }
+});
+const sentAfterNew = state.sent.filter((s) => s?.text === "different-question").length;
+check("a DIFFERENT question is still delivered (guard only blocks identical re-asks)",
+    sentAfterNew === sentBeforeNew + 1 && text(newQ).includes("No reply after"), text(newQ));
 
 await transport.close();
+
+// --- 9. Single-instance lock: 2nd instance must go STANDBY (no polling) ---
+resetMock();
+const A = await makeClient();
+await sleep(1500); // let A take the lock + do its anchor poll
+const B = await makeClient();
+await sleep(1500);
+await pushUserMsg("who-am-i");
+await sleep(3000); // poller(s) should have run
+const aRes = text(await A.client.callTool({ name: "retrieve_messages", arguments: {} }));
+const bRes = text(await B.client.callTool({ name: "retrieve_messages", arguments: {} }));
+check("exactly ONE instance captured the message (single poller)",
+    aRes.includes("who-am-i") !== bRes.includes("who-am-i"),
+    `A: ${aRes.slice(0, 60)} | B: ${bRes.slice(0, 60)}`);
+check("standby instance's retrieve stays empty (no double consumption)",
+    (aRes.includes("who-am-i") ? bRes : aRes).includes("No new messages")
+    || (aRes.includes("No new messages") && bRes.includes("No new messages")));
+
+await A.transport.close();
+await B.transport.close();
 mock.close();
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

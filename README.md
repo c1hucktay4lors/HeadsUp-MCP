@@ -130,8 +130,13 @@ Example flow:
 
 Notes:
 
-- Every reply you send gets an automatic **"👍 Got it — I'll pass this to the AI."** ack so you know it landed.
-- `wait_for_reply` is capped at **55s** because MCP clients (LM Studio, the SDK) time out tool calls at ~60s. If it times out, the model just calls it again — a reply that arrived meanwhile is returned instantly, so nothing is lost.
+- `wait_for_reply` is capped at **55s** because MCP clients (LM Studio, the SDK) time out tool calls at ~60s. A reply that arrives while it waits is returned instantly; a reply that arrives right after a timeout is served instantly on the next call, so nothing is lost.
+- **Loop safety (learned the hard way):** small local models can get stuck calling these tools in a tight loop, and the bot used to auto-ack every user message — which fed the loop back to life. Now:
+  - the bot **never** sends an automatic "got it" reply to your messages;
+  - `wait_for_reply` refuses to re-send a question that just timed out (30s cooldown, identical questions only);
+  - `retrieve_messages` trips a circuit breaker (🛑) after 3 consecutive empty checks;
+  - all of these tell the model to **stop and wait for you in LM Studio** rather than keep going.
+- **Single-instance lock:** LM Studio can leave old MCP server instances running across restarts; since every instance would otherwise poll the same bot token and re-receive every message, only the first live instance polls — the rest sit in standby. The server also exits when its LM Studio connection closes (no more zombie pollers).
 - Messages are held **in memory only**: they belong to the model's current conversation. If LM Studio restarts, the queue is gone (your messages stay in your Telegram history, of course).
 - Replies from other chats/devices are ignored unless their chat ID is in `TELEGRAM_CHAT_ID`.
 
