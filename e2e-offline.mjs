@@ -195,6 +195,57 @@ check("same update NOT re-queued on later polls (flood regression)",
     !second.includes("flood-test"), second.slice(0, 100));
 
 await C.transport.close();
+
+// --- 11. send_telegram_notification: emoji present + ONE bubble ---
+// Regression guard for the "style.emoji defined but never sent" and
+// "title sent as a separate message" bugs (v2.4 fixes).
+resetMock();
+const D = await makeClient();
+await sleep(1500); // let D anchor + settle the lock
+const n1 = await D.client.callTool({
+    name: "send_telegram_notification",
+    arguments: { message: "The list was sorted correctly.", type: "success", title: "Sort Task" }
+});
+check("notification reported success", n1.isError !== true, text(n1));
+check("notification is ONE message (no separate title bubble)",
+    state.sent.length === 1, JSON.stringify(state.sent.map((s) => s?.text)));
+const nBody = state.sent[0]?.text || "";
+check("notification contains the type emoji", nBody.includes("✅"), JSON.stringify(nBody));
+check("notification contains the custom title", nBody.includes("Sort Task"), JSON.stringify(nBody));
+check("title and body are in the SAME message",
+    nBody.includes("Sort Task") && nBody.includes("sorted correctly"), JSON.stringify(nBody));
+
+// --- 12. Long notification splits, header rides chunk 1, all under the limit ---
+state.sent.length = 0;
+const longBody = "word ".repeat(1500).trim(); // ~7500 chars -> multiple chunks
+const n2 = await D.client.callTool({
+    name: "send_telegram_notification",
+    arguments: { message: longBody, type: "error" }
+});
+check("long notification reported success", n2.isError !== true, text(n2));
+check("long notification split into >1 message", state.sent.length >= 2, `sent ${state.sent.length}`);
+check("first chunk carries the header (❌)", (state.sent[0]?.text || "").includes("❌"),
+    JSON.stringify((state.sent[0]?.text || "").slice(0, 60)));
+check("every chunk stays under the 4096 Telegram limit",
+    state.sent.every((s) => (s?.text || "").length <= 4096),
+    state.sent.map((s) => (s?.text || "").length).join(","));
+
+// --- 13. HARD rate limit: a runaway tool loop gets a real server-side error ---
+// (soft guards are prompt-text; this is the belt-and-suspenders that fires
+// even if the model ignores them)
+await D.client.callTool({ name: "retrieve_messages", arguments: {} }); // drain
+let hitHard = false;
+for (let i = 0; i < 40; i++) {
+    const r = await D.client.callTool({ name: "retrieve_messages", arguments: {} });
+    if (text(r).includes("HARD LIMIT")) { hitHard = true; break; }
+}
+check("hard rate limit fires (real error, not just text)", hitHard);
+if (hitHard) {
+    const r = await D.client.callTool({ name: "retrieve_messages", arguments: {} });
+    check("rate-limited call is flagged isError", r.isError === true);
+}
+
+await D.transport.close();
 mock.close();
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -4,6 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 
 // Bot token comes from the environment (set in mcp.json). Never hardcode it.
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN || "").trim();
@@ -37,14 +38,16 @@ const NOTIF_TYPES = {
 // Telegram hard limit is 4096 chars per message
 const MAX_MSG_LEN = 4000;
 
-// Split long text into chunks under MAX_MSG_LEN, preferring line/space boundaries
-function splitMessage(text) {
+// Split long text into chunks under maxLen, preferring line/space boundaries.
+// Callers can pass a smaller budget (e.g. to reserve room for a header that
+// will be prepended to the first chunk).
+function splitMessage(text, maxLen = MAX_MSG_LEN) {
     const chunks = [];
     let rest = text;
-    while (rest.length > MAX_MSG_LEN) {
-        let cut = rest.lastIndexOf("\n", MAX_MSG_LEN);
-        if (cut < MAX_MSG_LEN * 0.5) cut = rest.lastIndexOf(" ", MAX_MSG_LEN);
-        if (cut < MAX_MSG_LEN * 0.5) cut = MAX_MSG_LEN;
+    while (rest.length > maxLen) {
+        let cut = rest.lastIndexOf("\n", maxLen);
+        if (cut < maxLen * 0.5) cut = rest.lastIndexOf(" ", maxLen);
+        if (cut < maxLen * 0.5) cut = maxLen;
         chunks.push(rest.slice(0, cut));
         rest = rest.slice(cut).replace(/^\s+/, "");
     }
@@ -56,7 +59,9 @@ async function sendTelegram(chatId, payload) {
     const res = await fetch(`${API_BASE}/bot${TELEGRAM_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, ...payload })
+        body: JSON.stringify({ chat_id: chatId, ...payload }),
+        // A hung network must not wedge a tool call forever.
+        signal: AbortSignal.timeout(10000)
     });
     if (!res.ok) {
         let detail = `HTTP ${res.status}`;
@@ -76,7 +81,15 @@ const LOG_PREFIX = "[telegram-notifier]";
 const log = (msg) => console.error(LOG_PREFIX, msg);
 
 const MAX_BUFFERED = 50;        // keep recent inbound messages in memory
-const POLL_INTERVAL_MS = 1500;  // how often we check for new updates
+const POLL_INTERVAL_MS = 1500;  // gap between consecutive polls (after a response)
+// True long-polling: ask Telegram to hold the connection open up to N seconds
+// waiting for a new update (Bot API max is 50). Compared with timeout=0 +
+// client-side sleep this cuts idle request volume ~15x AND improves reply
+// latency — we are notified the instant a message arrives.
+const LONG_POLL_TIMEOUT_S = 25;
+// The getUpdates fetch must outlive the server-side hold, or we would abort a
+// legitimately in-flight long poll. Add margin for network latency.
+const FETCH_TIMEOUT_S = LONG_POLL_TIMEOUT_S + 10;
 // NOTE: MCP clients (incl. LM Studio / the SDK) time out tool requests at
 // ~60s, so a blocking wait must stay well under that. The model can simply
 // call wait_for_reply again — a reply that arrived meanwhile is returned
@@ -100,6 +113,31 @@ const emptyRetrieves = { count: 0, since: 0 };
 
 const CHAT_SET = new Set(CHAT_IDS);
 
+// HARD rate limit — a genuine safety net on top of the soft (prompt-text)
+// loop guards. Small models can ignore "STOP" text and keep calling; this
+// returns a real MCP error once a tool is called too often in a rolling
+// window, so even a model that reads none of the guard text gets blocked
+// server-side. Limits are set well above legitimate use (a model checking
+// for a reply a few times, a retry loop with short sleeps) but far below a
+// true runaway (hundreds of calls with no delay).
+const RATE_WINDOW_MS = 60000;
+const RATE_LIMITS = {
+    retrieve_messages: 30,
+    wait_for_reply: 10,
+    send_message: 40,
+    send_telegram_notification: 40,
+};
+const _rateCalls = {}; // toolName -> timestamps within the current window
+function rateLimited(tool) {
+    const limit = RATE_LIMITS[tool];
+    if (!limit) return false;
+    const now = Date.now();
+    const calls = (_rateCalls[tool] = (_rateCalls[tool] || []).filter((t) => now - t < RATE_WINDOW_MS));
+    if (calls.length >= limit) return true; // over limit — refuse (don't record)
+    calls.push(now);
+    return false;
+}
+
 // True once main() confirms this instance holds the poll lock.
 let IS_POLLER = false;
 const STANDBY_NOTE =
@@ -114,11 +152,17 @@ const STANDBY_NOTE =
 // instance — so N instances = N acks per message + N model loops.
 // Only the instance holding this lock may poll; the others go to
 // standby (they still serve tool calls from their own queues).
-// The lock is keyed per API base, so offline/mock tests are unaffected.
-const LOCK_FILE = path.join(
-    os.tmpdir(),
-    `headsup-telegram-${Buffer.from(`${API_BASE}|${TELEGRAM_TOKEN}|${CHAT_IDS.join(",")}`).toString("base64url").slice(0, 32)}.lock`
-);
+// The lock is keyed per API base + token + chat id, so offline/mock tests are
+// unaffected.
+// IMPORTANT: derive the filename from a SHA-256 HASH of that identity, not a
+// base64url encoding of it — base64url is a reversible encoding, so it would
+// leak ~24 bytes of the raw bot token into a world-listable tmpdir filename.
+const LOCK_ID = crypto
+    .createHash("sha256")
+    .update(`${API_BASE}|${TELEGRAM_TOKEN}|${CHAT_IDS.join(",")}`)
+    .digest("hex")
+    .slice(0, 32);
+const LOCK_FILE = path.join(os.tmpdir(), `headsup-telegram-${LOCK_ID}.lock`);
 
 function isProcessAlive(pid) {
     try { process.kill(pid, 0); return true; } catch { return false; }
@@ -183,17 +227,19 @@ function handleIncoming(msg) {
     }
 }
 
-function getUpdatesUrl(offset, limit) {
+function getUpdatesUrl(offset, limit, timeoutSecs = 0) {
     const params = new URLSearchParams();
-    params.set("timeout", "0");
+    // timeout>0 => true long-polling (server holds the connection). timeout=0
+    // is used when draining the backlog (anchor) where we want instant answers.
+    params.set("timeout", String(timeoutSecs));
     params.set("allowed_updates", JSON.stringify(["message"]));
     if (offset !== null) params.set("offset", String(offset));
     if (limit) params.set("limit", String(limit));
     return `${API_BASE}/bot${TELEGRAM_TOKEN}/getUpdates?${params.toString()}`;
 }
 
-async function fetchUpdates(url) {
-    const res = await fetch(url);
+async function fetchUpdates(url, timeoutSecs = FETCH_TIMEOUT_S) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutSecs * 1000) });
     if (!res.ok) {
         let detail = `HTTP ${res.status}`;
         try { detail = (await res.json()).description || detail; } catch {}
@@ -226,11 +272,23 @@ async function pollOnce() {
     if (incoming.lastUpdateId === null) {
         incoming.lastUpdateId = await anchorToNow();
     }
-    const result = await fetchUpdates(getUpdatesUrl(incoming.lastUpdateId + 1, 100));
+    // Long-poll: Telegram holds the connection up to LONG_POLL_TIMEOUT_S.
+    const result = await fetchUpdates(
+        getUpdatesUrl(incoming.lastUpdateId + 1, 100, LONG_POLL_TIMEOUT_S)
+    );
     for (const u of result) {
         incoming.lastUpdateId = Math.max(incoming.lastUpdateId, u.update_id);
+        if (!u.message) continue;
         // NOTE: chat.id arrives as a JSON number; CHAT_SET holds strings from env.
-        if (u.message && CHAT_SET.has(String(u.message.chat?.id))) handleIncoming(u.message);
+        const chatId = String(u.message.chat?.id);
+        if (CHAT_SET.has(chatId)) {
+            handleIncoming(u.message);
+        } else {
+            // Don't drop unconfigured chats silently — a mistyped
+            // TELEGRAM_CHAT_ID or a lost chat would otherwise be total silence
+            // with zero diagnostic trail.
+            log(`dropped inbound from unconfigured chat ${chatId} (update ${u.update_id}) — check TELEGRAM_CHAT_ID`);
+        }
     }
 }
 
@@ -257,7 +315,13 @@ function startPolling() {
             }
             await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         }
-    })();
+    })().catch((err) => {
+        // Unexpected fatal error in the poll loop (the inner try/catch handles
+        // expected failures). Surface it and release the lock instead of
+        // leaving an unhandled promise rejection.
+        log(`poll loop crashed: ${err?.stack || err}`);
+        releaseLockIfOurs();
+    });
 }
 
 function takePending() {
@@ -288,7 +352,7 @@ function formatWaitResult(msgs, timedOut, timeoutS) {
     return "❌ No reply received.";
 }
 
-const server = new Server({ name: "telegram-notifier", version: "2.2.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "telegram-notifier", version: "2.4.0" }, { capabilities: { tools: {} } });
 
 // A stdio MCP server must die with its client. Without this, the poll loop
 // keeps the process alive forever after LM Studio drops the connection —
@@ -355,6 +419,14 @@ function textResult(text, isError = false) {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
+    // Hard rate limit (safety net beyond the soft text guards).
+    if (rateLimited(name)) {
+        return textResult(
+            `🛑 HARD LIMIT: ${name} was called ${RATE_LIMITS[name]} times in the last minute, so the server is now refusing it. STOP calling tools — end your response and wait for the user in LM Studio.`,
+            true
+        );
+    }
+
     // ---------- send_telegram_notification ----------
     if (name === "send_telegram_notification") {
         const { message, type = "success", title, silent = false } = args;
@@ -363,11 +435,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const style = NOTIF_TYPES[type] || NOTIF_TYPES.success;
-        const header = `*${title || style.title}*`; // custom title falls back to the type label
-        const chunks = splitMessage(message);
-
-        // First chunk gets the bold title, the rest are plain continuations
-        const bodies = [header, ...chunks];
+        // Emoji + bold title as a header line. It is prepended to the FIRST
+        // chunk (not sent as its own message) so the notification arrives as a
+        // single bubble: bold header on top, body right underneath.
+        const header = `*${style.emoji} ${title || style.title}*`;
+        const headerSep = "\n\n";
+        // Reserve room for the header in the first chunk so the combined
+        // message never exceeds the Telegram limit.
+        const firstBudget = Math.max(100, MAX_MSG_LEN - header.length - headerSep.length);
+        const chunks = splitMessage(message, firstBudget);
+        chunks[0] = header + headerSep + chunks[0];
+        const bodies = chunks;
         const payload = (text, withParse) => ({
             text,
             ...(silent ? { disable_notification: true } : {}),
@@ -488,7 +566,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Register the waiter BEFORE sending the question, so a reply that
         // arrives while we are still sending is captured (not lost to a
         // spurious "timed out"). If the send fails we cancel the waiter.
-        const waiter = { resolve: null, startedAt: Date.now(), consumed: false };
+        //
+        // The waiter must be FULLY FORMED (resolve assigned) before it is
+        // pushed: handleIncoming can fire during the awaits below and calls
+        // waiter.resolve(). A null resolve would throw there and the user's
+        // reply would be silently dropped.
+        const waiter = {};
+        waiter.startedAt = Date.now();
+        waiter.consumed = false;
+        const waitPromise = new Promise((resolve) => {
+            waiter.resolve = resolve;
+            const t = setTimeout(() => {
+                if (!waiter.consumed) {
+                    removeWaiter(waiter);
+                    resolve([]); // timed out
+                }
+            }, timeoutS * 1000);
+            t.unref?.();
+        });
         incoming.waiters.push(waiter);
 
         // Send the question to all chats
@@ -519,16 +614,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Block until the next inbound message arrives or the timeout expires
-        const result = await new Promise((resolve) => {
-            waiter.resolve = resolve;
-            const t = setTimeout(() => {
-                if (!waiter.consumed) {
-                    removeWaiter(waiter);
-                    resolve([]); // timed out
-                }
-            }, timeoutS * 1000);
-            t.unref?.();
-        });
+        // (waiter + timeout were set up before the send, above).
+        const result = await waitPromise;
 
         lastAsk.question = question.trim();
         lastAsk.at = Date.now();

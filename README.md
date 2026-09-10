@@ -1,7 +1,3 @@
-RENAME INDEX.TXT TO INDEX.JS. HAD TO CHANGE IT SO I COULD EMAIL IT TO YOU
-
--Max
-
 # Telegram Notifier MCP Toolkit
 
 A lightweight MCP server for [LM Studio](https://lmstudio.ai/) that gives the AI a two-way line to your phone: it sends you Telegram notifications when it finishes a task — **and it can read your replies back**, so you can answer questions mid-task without touching the computer.
@@ -12,7 +8,7 @@ A lightweight MCP server for [LM Studio](https://lmstudio.ai/) that gives the AI
 - **Chat ID(s)** → configured per-user in `mcp.json` (multiple supported, comma-separated)
 - The AI automatically calls the `send_telegram_notification` tool when it finishes your prompt
 - Notifications come in four flavors: ✅ success, ℹ️ info, ⚠️ warning, ❌ error
-- A background long-poll loop (`getUpdates`, every 1.5s) captures anything **you** send the bot, and the AI reads it back with `retrieve_messages` / `wait_for_reply`
+- A background poll loop (`getUpdates`, true long-polling — Telegram holds the connection up to 25s) captures anything **you** send the bot, and the AI reads it back with `retrieve_messages` / `wait_for_reply`. Long-polling keeps idle request volume low and delivers your reply the instant it arrives.
 
 ## Prerequisites
 
@@ -132,17 +128,20 @@ Notes:
   - the bot **never** sends an automatic "got it" reply to your messages;
   - `wait_for_reply` refuses to re-send a question that just timed out (30s cooldown, identical questions only);
   - `retrieve_messages` trips a circuit breaker (🛑) after 3 consecutive empty checks;
+  - a **hard server-side rate limit** (real MCP error, not just prompt text) refuses any tool called too often in a rolling minute — so even a model that ignores all the "stop" text gets blocked;
   - all of these tell the model to **stop and wait for you in LM Studio** rather than keep going.
 - **Single-instance lock:** LM Studio can leave old MCP server instances running across restarts; since every instance would otherwise poll the same bot token and re-receive every message, only the first live instance polls — the rest sit in standby. The server also exits when its LM Studio connection closes (no more zombie pollers).
 - Messages are held **in memory only**: they belong to the model's current conversation. If LM Studio restarts, the queue is gone (your messages stay in your Telegram history, of course).
-- Replies from other chats/devices are ignored unless their chat ID is in `TELEGRAM_CHAT_ID`.
+- Replies from other chats/devices are ignored unless their chat ID is in `TELEGRAM_CHAT_ID` — and each dropped message is logged to stderr with the offending chat ID, so a mistyped `TELEGRAM_CHAT_ID` is diagnosable instead of silent.
 
 ## Testing
 
 ```bash
 npm test            # offline end-to-end suite (mock Bot API — no phone, no real Telegram)
-node e2e-test.mjs   # live test against the real bot — reply to your phone to finish the loop
+node e2e-test.mjs   # LIVE test against the real bot — reply to your phone to finish the loop
 ```
+
+> `e2e-test.mjs` is the **live** test: it really sends a message to your phone. It reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from the environment (or a `.env` file next to it) and exits with a clear error if either is missing — nothing is hardcoded, so the file is safe to share.
 
 ## Sharing With Others
 

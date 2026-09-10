@@ -1,1 +1,14 @@
 node_modules/
+
+# Secrets — never commit a bot token or env file
+.env
+.env.*
+
+# Runtime lock files (keyed per bot, but keep out of version control)
+*.lock
+headsup-telegram-*.lock
+
+# Archives / local scratch
+Archive.zip
+*.zip
+index copy.js

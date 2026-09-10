@@ -1,12 +1,12 @@
 {
-  "name": "sms-mcp",
-  "version": "1.0.0",
-  "description": "A lightweight MCP server for [LM Studio](https://lmstudio.ai/) that sends a Telegram push notification to your phone when the AI finishes a task.",
+  "name": "headsup-telegram-mcp",
+  "version": "2.4.0",
+  "description": "A lightweight MCP server for [LM Studio](https://lmstudio.ai/) that gives the model a two-way line to your phone over Telegram: send notifications/questions and read your replies back.",
   "main": "index.js",
   "scripts": {
     "test": "node e2e-offline.mjs"
   },
-  "keywords": [],
+  "keywords": ["mcp", "telegram", "lmstudio", "notifications"],
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0"
